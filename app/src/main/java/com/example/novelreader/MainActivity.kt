@@ -15,7 +15,16 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.*
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -27,9 +36,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
@@ -59,19 +72,36 @@ import java.nio.charset.CodingErrorAction
 import java.util.UUID
 
 private const val MAX_BYTES = 100 * 1024 * 1024
-data class Book(val id: String, val title: String, val added: Long)
+data class Book(val id: String, val title: String, val added: Long, val author: String = "", val cached: Int = 0, val total: Int = 0)
 data class Chapter(val title: String, val paragraphIndex: Int)
 data class Reading(val book: Book, val paragraphs: List<String>, val index: Int, val offset: Int,
     val chapters: List<Chapter>, val character: Int = 0, val bytes: Long = 0)
 
 private val chapterHeading = Regex("^(?:第[零〇一二三四五六七八九十百千万两壹贰叁肆伍陆柒捌玖拾佰仟0-9０-９]+[章卷回部节集季篇]|chapter\\s+[0-9ivxlcdm]+\\b|(?:序章|楔子|引子|序言|前言|后记|尾声|终章|番外)(?:$|[\\s：:、（(]|[一二三四五六七八九十0-9]))", RegexOption.IGNORE_CASE)
 
-internal fun findChapters(paragraphs: List<String>): List<Chapter> =
-    paragraphs.mapIndexedNotNull { index, paragraph ->
+internal fun duplicateChapterTitles(paragraphs: List<String>): Set<Int> {
+    val duplicates = hashSetOf<Int>()
+    var previous = ""
+    paragraphs.forEachIndexed { index, paragraph ->
         val title = paragraph.trim().removePrefix("\uFEFF").trim()
-        if (title.length in 2..80 && chapterHeading.containsMatchIn(title) &&
+        if (title.isNotBlank()) {
+            val heading = title.length in 2..80 && chapterHeading.containsMatchIn(title) && title.none { it in "。！？!?；;" }
+            val normalized = title.filterNot { it.isWhitespace() || Character.isSpaceChar(it) || it == '\u200B' || it == '\uFEFF' }
+            if (heading && previous == normalized) duplicates.add(index)
+            previous = if (heading) normalized else ""
+        }
+    }
+    return duplicates
+}
+
+internal fun findChapters(paragraphs: List<String>): List<Chapter> {
+    val duplicates = duplicateChapterTitles(paragraphs)
+    return paragraphs.mapIndexedNotNull { index, paragraph ->
+        val title = paragraph.trim().removePrefix("\uFEFF").trim()
+        if (index !in duplicates && title.length in 2..80 && chapterHeading.containsMatchIn(title) &&
             title.none { it in "。！？!?；;" }) Chapter(title, index) else null
     }
+}
 
 internal fun chapterAt(chapters: List<Chapter>, paragraph: Int): Int {
     var low = 0
@@ -95,29 +125,47 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
     var downloadStatus by mutableStateOf(""); private set
     var downloading by mutableStateOf(false); private set
     var downloadingBook by mutableStateOf<Book?>(null); private set
+    var downloadTitle by mutableStateOf(""); private set
+    var cachedChapters by mutableStateOf(0); private set
+    var totalChapters by mutableStateOf(0); private set
+    fun readingLabel(book: Book): String = prefs.getString("${book.id}.chapterLabel", null) ?: "尚未开始阅读"
+    private fun rememberChapter(id: String, paragraph: Int) {
+        val current = reading?.takeIf { it.book.id == id } ?: return
+        val position = chapterAt(current.chapters, paragraph)
+        val label = if (position >= 0) current.chapters[position].title else "正文开头"
+        prefs.edit().putString("$id.chapterLabel", label).apply()
+    }
     val availableBytes = mutableStateMapOf<String, Long>()
     private var downloadJob: Job? = null
     fun stopDownload() { downloadJob?.cancel() }
-    fun startStreaming(title: String, action: suspend (suspend (String) -> Unit, (String) -> Unit) -> Unit) {
+    fun startStreaming(title: String, author: String = "", total: Int = 0, action: suspend (suspend (String, Int) -> Unit, (String) -> Unit) -> Unit) {
         if (downloading) { notice = "已有一本书正在下载，请先完成或停止。"; return }
         downloading = true; downloadingBook = null; downloadStatus = "正在准备下载…"
+        downloadTitle = title; cachedChapters = 0; totalChapters = total
         downloadJob = scope.launch {
-            val book = Book(UUID.randomUUID().toString(), title.take(100), System.currentTimeMillis())
+            val book = Book(UUID.randomUUID().toString(), title.take(100), System.currentTimeMillis(), author, total = total)
             val file = File(folder, "${book.id}.txt")
             try {
-                action({ addition ->
+                action({ addition, addedChapters ->
                     val length = bookLock.withLock { withContext(Dispatchers.IO) {
                         require(file.length() + addition.toByteArray(Charsets.UTF_8).size <= MAX_BYTES) { "小说超过 100 MB。" }
                         val original = file.length()
                         try { file.appendText(addition) }
                         catch (e: Exception) { java.io.RandomAccessFile(file, "rw").use { it.setLength(original) }; throw e }
                         val metadata = File(folder, "${book.id}.json")
-                        if (!metadata.exists()) metadata.writeText(JSONObject().put("title", book.title).put("added", book.added).toString())
+                        val json = if (metadata.exists()) JSONObject(metadata.readText()) else JSONObject().put("title", book.title).put("added", book.added)
+                        val count = cachedChapters + addedChapters
+                        json.put("author", author).put("cached", count).put("total", total)
+                        val atomic = android.util.AtomicFile(metadata)
+                        val stream = atomic.startWrite()
+                        try { stream.write(json.toString().toByteArray(Charsets.UTF_8)); atomic.finishWrite(stream) }
+                        catch (e: Exception) { atomic.failWrite(stream); throw e }
                         file.length()
                     } }
                     availableBytes[book.id] = length
+                    cachedChapters += addedChapters
                     if (downloadingBook?.id != book.id) downloadingBook = book
-                    if (books.none { it.id == book.id }) refresh()
+                    refresh()
                 }, { downloadStatus = it })
                 downloadStatus = "下载完成：${downloadingBook?.title ?: book.title}"
             } catch (e: CancellationException) { downloadStatus = "下载已停止，已下载内容仍可阅读。"; throw e }
@@ -144,6 +192,8 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
     var aaaQuery by mutableStateOf("")
     var notice by mutableStateOf<String?>(null)
     var night by mutableStateOf(prefs.getBoolean("night", false)); private set
+    var fontFace by mutableStateOf(prefs.getInt("fontFaceSystemDefault", 4).coerceIn(0, 4)); private set
+    fun changeFontFace(value: Int) { fontFace = value.coerceIn(0, 4); prefs.edit().putInt("fontFaceSystemDefault", fontFace).apply() }
     var fontSize by mutableStateOf(prefs.getInt("font", 20).coerceIn(14, 32)); private set
     var paper by mutableStateOf(prefs.getInt("paper", 0).coerceIn(0, 4)); private set
     fun changePaper(value: Int) { paper = value.coerceIn(0, 4); prefs.edit().putInt("paper", paper).apply(); changeNight(false) }
@@ -164,7 +214,7 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
             folder.listFiles().orEmpty().filter { it.extension == "json" }.mapNotNull { file ->
                 runCatching {
                     val json = JSONObject(file.readText())
-                    Book(file.nameWithoutExtension, json.getString("title"), json.getLong("added"))
+                    Book(file.nameWithoutExtension, json.getString("title"), json.getLong("added"), json.optString("author"), json.optInt("cached"), json.optInt("total"))
                 }.getOrNull()
             }.sortedByDescending { it.added }
         }
@@ -244,9 +294,11 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
             prefs.getInt("${book.id}.character", 0).coerceAtLeast(0), snapshot.second)
     }
     fun progress(id: String, index: Int, offset: Int) {
+        rememberChapter(id, index)
         prefs.edit().putInt("$id.index", index).putInt("$id.offset", offset).apply()
     }
     fun pageProgress(id: String, paragraph: Int, character: Int) {
+        rememberChapter(id, paragraph)
         prefs.edit().putInt("$id.index", paragraph).putInt("$id.offset", 0).putInt("$id.character", character).apply()
     }
     fun close() { reading = null }
@@ -275,7 +327,7 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
             check(!metadata.exists() || metadata.delete()) { "删除失败，请重试。" }
             File(folder, "${book.id}.txt").delete()
             pageStore.removeBook(book.id)
-            prefs.edit().remove("${book.id}.index").remove("${book.id}.offset").remove("${book.id}.character").apply()
+            prefs.edit().remove("${book.id}.index").remove("${book.id}.offset").remove("${book.id}.character").remove("${book.id}.chapterLabel").apply()
         }
         memoryPages.keys.filter { it.startsWith("${book.id}|") }.forEach { memoryPages.remove(it) }
         refresh()
@@ -309,7 +361,56 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
+private fun WelcomeScreen() {
+    val paper = Color(0xFFF6F3EA)
+    val ink = Color(0xFF40554C)
+    Surface(Modifier.fillMaxSize(), color = paper) {
+        Box(Modifier.fillMaxSize()) {
+            androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+                val w = size.width; val h = size.height
+                fun mountain(points: List<Pair<Float, Float>>, color: Color) {
+                    val path = androidx.compose.ui.graphics.Path().apply {
+                        moveTo(0f, h)
+                        points.forEach { (x,y) -> lineTo(x*w, y*h) }
+                        lineTo(w,h); close()
+                    }
+                    drawPath(path, color)
+                }
+                mountain(listOf(0f to .78f,.12f to .75f,.23f to .77f,.38f to .69f,.48f to .76f,.61f to .70f,.74f to .77f,.90f to .72f,1f to .78f), Color(0xFFDDE3DE))
+                mountain(listOf(0f to .91f,.13f to .84f,.20f to .88f,.34f to .77f,.40f to .85f,.46f to .81f,.55f to .90f,.72f to .85f,.86f to .88f,1f to .83f), Color(0xFFBCCBC3).copy(alpha=.60f))
+                mountain(listOf(0f to .96f,.10f to .93f,.16f to .88f,.23f to .95f,.40f to .96f,.57f to .93f,.68f to .88f,.77f to .94f,.89f to .90f,1f to .98f), Color(0xFF829A8D).copy(alpha=.40f))
+                drawRect(androidx.compose.ui.graphics.Brush.verticalGradient(listOf(paper.copy(alpha=0f),paper.copy(alpha=.78f),paper.copy(alpha=0f)), startY=h*.8f, endY=h), topLeft=androidx.compose.ui.geometry.Offset(0f,h*.8f), size=androidx.compose.ui.geometry.Size(w,h*.2f))
+                val stem = androidx.compose.ui.graphics.Path().apply { moveTo(-w*.03f,h*.09f); quadraticBezierTo(w*.15f,h*.13f,w*.39f,h*.25f) }
+                drawPath(stem,ink.copy(alpha=.36f),style=androidx.compose.ui.graphics.drawscope.Stroke(width=2.dp.toPx()))
+                for (i in 0..7) {
+                    val x=w*(.025f+i*.041f);val y=h*(.112f+i*.016f)
+                    for (side in listOf(-1f,1f)) {
+                        val leaf=androidx.compose.ui.graphics.Path().apply {
+                            moveTo(x,y)
+                            quadraticBezierTo(x+w*.04f,y+side*h*.004f,x+w*.065f,y+side*h*.031f)
+                            quadraticBezierTo(x+w*.025f,y+side*h*.020f,x,y)
+                            close()
+                        }
+                        drawPath(leaf,ink.copy(alpha=.20f+(i%3)*.035f))
+                    }
+                }
+            }
+            Column(Modifier.align(Alignment.Center).padding(bottom = 40.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("悦\n读", color = ink, fontSize = 54.sp, lineHeight = 76.sp,
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Serif)
+                Spacer(Modifier.height(22.dp))
+                Text("把故事留在身边", color = ink.copy(alpha=.7f), fontSize = 15.sp, letterSpacing = 4.sp)
+            }
+            Text("悦读 · 1.1\n制作者：草莓熊", Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom=24.dp), color=ink.copy(alpha=.7f), fontSize=12.sp, lineHeight=24.sp, textAlign=androidx.compose.ui.text.style.TextAlign.Center)
+        }
+    }
+}
+
+@Composable
 private fun ReaderApp(model: ReaderModel) {
+    var welcome by rememberSaveable { mutableStateOf(true) }
+    LaunchedEffect(Unit) { delay(1500); welcome = false }
+    if (welcome) { WelcomeScreen(); return }
     val colors = if (model.night) darkColorScheme(primary = Color(0xFFADCDB8), background = Color(0xFF171C19))
         else lightColorScheme(primary = Color(0xFF365F49), background = Color(0xFFF7F3E9), surface = Color(0xFFFFFBF2))
     MaterialTheme(colorScheme = colors) {
@@ -341,53 +442,151 @@ private fun Shelf(model: ReaderModel) {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) model.importFile(uri)
     }
-    Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
-        Spacer(Modifier.height(24.dp))
-        Text("悦读", fontSize = 32.sp, fontWeight = FontWeight.Bold)
-        Text("把故事留在身边", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(20.dp))
-        OutlinedTextField(value = model.aaaQuery, onValueChange = { model.aaaQuery = it },
-            modifier = Modifier.fillMaxWidth(), singleLine = true,
-            placeholder = { Text("搜索书名或作者") },
-            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Search),
-            keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSearch = {
-                if (model.aaaQuery.isNotBlank() && !model.busy) model.aaaOnline = true
-            }),
-            trailingIcon = { TextButton(enabled = model.aaaQuery.isNotBlank() && !model.busy,
-                onClick = { model.aaaOnline = true }) { Text("搜索") } })
-        Spacer(Modifier.height(12.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(onClick = { picker.launch(arrayOf("*/*")) }, enabled = !model.busy) { Text("导入 TXT") }
-            OutlinedButton(onClick = { model.online = true }, enabled = !model.busy) { Text("在线找书 · 备用") }
-        }
-        Spacer(Modifier.height(24.dp))
-        Text("我的书架 · ${model.books.size} 本", fontWeight = FontWeight.SemiBold)
-        if (model.downloadStatus.isNotBlank()) {
-            Text(model.downloadStatus, style = MaterialTheme.typography.bodySmall)
-            if (model.downloading) TextButton(onClick = { model.stopDownload() }) { Text("停止下载") }
-        }
-        Spacer(Modifier.height(12.dp))
-        if (model.books.isEmpty()) {
-            Text("书架还是空的\n\n导入手机里的 TXT 文件，开始阅读。\n内容保存在本机，离线也能阅读。",
-                modifier = Modifier.padding(vertical = 28.dp), lineHeight = 28.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
-            items(model.books, key = { it.id }) { book ->
-                Card(Modifier.fillMaxWidth().clickable(enabled = !model.busy) { model.open(book) }) {
-                    Row(Modifier.padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Column(Modifier.weight(1f)) {
-                            Text(book.title, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+    var about by remember { mutableStateOf(false) }
+    val homeContext = LocalContext.current
+    val titleFont = remember(homeContext) {
+        val file = "fonts/SanJiXingKai-Bold.ttf"
+        FontFamily(android.graphics.Typeface.createFromAsset(homeContext.assets, file))
+    }
+    var searchFocused by remember { mutableStateOf(false) }
+    var information by remember { mutableStateOf<Book?>(null) }
+    val green = if (model.night) Color(0xFFADCDB8) else Color(0xFF3F6F5A)
+    val ink = if (model.night) Color(0xFFE3E7DF) else Color(0xFF2F302D)
+    val muted = if (model.night) Color(0xFFB0B8AA) else Color(0xFF737B70)
+    val paper = if (model.night) Color(0xFF171C19) else Color(0xFFF7F4E8)
+    val card = if (model.night) Color(0xFF252D26) else Color(0xFFFFFCF5)
+    val soft = if (model.night) Color(0xFF303C32) else Color(0xFFEEF1E8)
+    val round = RoundedCornerShape(22.dp)
+    ProvideTextStyle(MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.SansSerif, color = ink)) {
+      BoxWithConstraints(Modifier.fillMaxSize().background(paper)) {
+        val headerHeight = (maxHeight * .21f).coerceAtLeast(144.dp)
+        ShelfPaperBackdrop(model.night)
+        LazyColumn(Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            item {
+                Row(Modifier.fillMaxWidth().heightIn(min = headerHeight).padding(top = 32.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("悦读", fontSize = 48.sp, fontFamily = titleFont, fontWeight = FontWeight.Normal, color = green)
+                        Text("把故事留在身边", fontSize = 14.sp, color = muted, modifier = Modifier.padding(top = 10.dp))
+                    }
+                }
+            }
+            item {
+                OutlinedTextField(value = model.aaaQuery, onValueChange = { model.aaaQuery = it },
+                    modifier = Modifier.fillMaxWidth().onFocusChanged { searchFocused = it.isFocused }, singleLine = true, shape = round,
+                    textStyle = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 16.sp, color = ink),
+                    placeholder = { Text("搜索书名或作者", color = muted) },
+                    leadingIcon = { ShelfSearchIcon(green) },
+                    trailingIcon = if (searchFocused) {
+                        { TextButton(enabled = model.aaaQuery.isNotBlank() && !model.busy,
+                            onClick = { model.aaaOnline = true }) { Text("搜索", color = green) } }
+                    } else null,
+                    colors = OutlinedTextFieldDefaults.colors(unfocusedContainerColor = soft, focusedContainerColor = card,
+                        unfocusedBorderColor = Color.Transparent, focusedBorderColor = green),
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Search),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSearch = {
+                        if (model.aaaQuery.isNotBlank() && !model.busy) model.aaaOnline = true
+                    }))
+            }
+            item {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    FilledTonalButton(onClick = { model.online = true }, enabled = !model.busy,
+                        modifier = Modifier.weight(1f).heightIn(min = 50.dp), shape = round,
+                        colors = ButtonDefaults.filledTonalButtonColors(containerColor = soft, contentColor = green)) { Text("在线找书") }
+                    FilledTonalButton(onClick = { picker.launch(arrayOf("*/*")) }, enabled = !model.busy,
+                        modifier = Modifier.weight(1f).heightIn(min = 50.dp), shape = round,
+                        colors = ButtonDefaults.filledTonalButtonColors(containerColor = soft, contentColor = green)) { Text("导入 TXT") }
+                }
+            }
+            if (model.downloadStatus.isNotBlank()) item {
+                Surface(color = card, shape = round, modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(if (model.downloading) "正在缓存《${model.downloadingBook?.title ?: model.downloadTitle}》" else "下载记录",
+                                Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+                            if (model.downloading) TextButton(onClick = { model.stopDownload() }) { Text("停止", color = green) }
                         }
-                        Column {
-                            TextButton(onClick = { newTitle = book.title; renaming = book }, enabled = !model.busy) { Text("改名") }
-                            TextButton(onClick = { deleting = book }, enabled = !model.busy) { Text("删除") }
+                        if (model.totalChapters > 0) {
+                            val fraction = (model.cachedChapters.toFloat() / model.totalChapters).coerceIn(0f, 1f)
+                            LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth(), color = green, trackColor = soft)
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("${model.cachedChapters} / ${model.totalChapters} 章", fontSize = 12.sp, color = muted)
+                                Text("${(fraction * 100).toInt()}%", fontSize = 12.sp, color = muted)
+                            }
+                        }
+                        if (!model.downloading || model.totalChapters == 0) Text(model.downloadStatus, fontSize = 12.sp, color = muted)
+                    }
+                }
+            }
+            item {
+                Row(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("我的书架", Modifier.weight(1f), fontSize = 22.sp, fontFamily = FontFamily.Serif, fontWeight = FontWeight.SemiBold)
+                    Text("${model.books.size} 本", color = muted, fontSize = 13.sp)
+                }
+            }
+            if (model.books.isEmpty()) item {
+                Surface(color = card, shape = round, modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(24.dp)) {
+                        Text("把第一本故事放进书架", fontSize = 18.sp, fontFamily = FontFamily.Serif)
+                        Spacer(Modifier.height(8.dp))
+                        Text("搜索喜欢的书，或导入手机里的 TXT。\n保存后，离线也能阅读。", color = muted, lineHeight = 24.sp)
+                    }
+                }
+            }
+            items(model.books, key = { it.id }) { book ->
+                var expanded by remember { mutableStateOf(false) }
+                Card(onClick = { model.open(book) }, enabled = !model.busy,
+                    modifier = Modifier.fillMaxWidth(), shape = round,
+                    colors = CardDefaults.cardColors(containerColor = card, contentColor = ink)) {
+                    Row(Modifier.padding(start = 14.dp, top = 16.dp, end = 4.dp, bottom = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Surface(Modifier.size(width = 70.dp, height = 102.dp), color = soft, shape = RoundedCornerShape(8.dp)) {
+                            Column(Modifier.padding(9.dp), verticalArrangement = Arrangement.SpaceBetween) {
+                                Text(book.title, color = green, fontFamily = titleFont, fontSize = 17.sp,
+                                    lineHeight = 23.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                                Text("悦读", color = muted, fontSize = 9.sp)
+                            }
+                        }
+                        Column(Modifier.weight(1f).padding(top = 2.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(book.title, fontFamily = titleFont, fontSize = 24.sp, fontWeight = FontWeight.Normal, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            if (book.author.isNotBlank()) Text(book.author, color = muted, fontSize = 12.sp)
+                            Text(model.readingLabel(book), color = muted, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text(if (book.total > 0) "已缓存 ${book.cached} / ${book.total} 章" else "已保存到本机", color = muted, fontSize = 12.sp)
+                        }
+                        Box {
+                            IconButton(onClick = { expanded = true }, enabled = !model.busy,
+                                modifier = Modifier.semantics { contentDescription = "书籍菜单：${book.title}" }) {
+                                Text("⋮", fontSize = 24.sp, color = muted)
+                            }
+                            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                                DropdownMenuItem(text = { Text("更改书名") }, onClick = { expanded = false; newTitle = book.title; renaming = book })
+                                DropdownMenuItem(text = { Text("书籍信息") }, onClick = { expanded = false; information = book })
+                                DropdownMenuItem(text = { Text("删除", color = Color(0xFFB8655B)) },
+                                    enabled = !model.downloading || model.downloadingBook?.id != book.id,
+                                    onClick = { expanded = false; deleting = book })
+                            }
                         }
                     }
                 }
             }
+
+        }
+        FilledTonalButton(onClick = { about = true },
+            modifier = Modifier.align(Alignment.TopEnd).padding(top = 4.dp, end = 12.dp).zIndex(2f),
+            shape = RoundedCornerShape(20.dp),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+            colors = ButtonDefaults.filledTonalButtonColors(containerColor = card, contentColor = green)) {
+            Text("关于", fontSize = 13.sp)
         }
     }
+    }
+    if (about) AlertDialog(onDismissRequest = { about = false }, title = { Text("关于悦读") },
+        text = { Text("把故事留在身边\n\n版本 1.1\n制作者：草莓熊") },
+        confirmButton = { TextButton(onClick = { about = false }) { Text("知道了") } })
+    information?.let { book -> AlertDialog(onDismissRequest = { information = null }, title = { Text(book.title) },
+        text = { Text("作者：${book.author.ifBlank { "暂无信息" }}\n${model.readingLabel(book)}\n" +
+            if (book.total > 0) "已缓存 ${book.cached} / ${book.total} 章" else "本地 TXT 书籍") },
+        confirmButton = { TextButton(onClick = { information = null }) { Text("关闭") } }) }
     renaming?.let { book -> AlertDialog(onDismissRequest = { renaming = null }, title = { Text("更改书名") },
         text = { OutlinedTextField(value = newTitle, onValueChange = { if (it.length <= 100) newTitle = it },
             label = { Text("书名") }, singleLine = true, modifier = Modifier.fillMaxWidth()) },
@@ -398,6 +597,44 @@ private fun Shelf(model: ReaderModel) {
         text = { Text("将删除《${book.title}》在本应用中的副本和阅读进度，原 TXT 文件不受影响。") },
         confirmButton = { TextButton(onClick = { model.delete(book); deleting = null }) { Text("删除") } },
         dismissButton = { TextButton(onClick = { deleting = null }) { Text("取消") } }) }
+}
+
+@Composable
+private fun ShelfPaperBackdrop(night: Boolean) {
+    val context = LocalContext.current
+    val bitmap = remember(context) {
+        context.assets.open("home/background.png").use { android.graphics.BitmapFactory.decodeStream(it) }
+    }
+    androidx.compose.foundation.Image(
+        bitmap = bitmap.asImageBitmap(),
+        contentDescription = null, modifier = Modifier.fillMaxSize(),
+        contentScale = androidx.compose.ui.layout.ContentScale.FillBounds)
+    if (night) Box(Modifier.fillMaxSize().background(Color(0xFF101A14).copy(alpha = .86f)))
+}
+
+@Composable
+private fun ShelfSearchIcon(color: Color) {
+    androidx.compose.foundation.Canvas(Modifier.size(22.dp)) {
+        drawCircle(color, radius = size.minDimension * .30f,
+            center = androidx.compose.ui.geometry.Offset(size.width * .42f, size.height * .42f),
+            style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx()))
+        drawLine(color, androidx.compose.ui.geometry.Offset(size.width * .64f, size.height * .64f),
+            androidx.compose.ui.geometry.Offset(size.width * .9f, size.height * .9f), strokeWidth = 2.dp.toPx(),
+            cap = androidx.compose.ui.graphics.StrokeCap.Round)
+    }
+}
+
+private val readerFontNames = listOf("正楷", "宋体", "黑体", "行书", "系统默认")
+
+private fun readerFontFamily(context: Context, choice: Int): FontFamily {
+    if (choice == 4) return FontFamily.Default
+    if (choice == 2) return FontFamily.SansSerif
+    val path = when (choice) {
+        1 -> "fonts/YueDuSerif-Regular.ttf"
+        3 -> "fonts/ZhiMangXing-Regular.ttf"
+        else -> "fonts/TaiwanMOE-Kai.ttf"
+    }
+    return FontFamily(android.graphics.Typeface.createFromAsset(context.assets, path))
 }
 
 private val paperColors = listOf(Color(0xFFF7F3E9), Color(0xFFE1EBDD), Color(0xFFFFFFFF), Color(0xFFE4E8EC), Color(0xFFF3E2D9))
@@ -480,13 +717,31 @@ private fun ColumnScope.Reader(model: ReaderModel, reading: Reading) {
     var anchorParagraph by remember { mutableIntStateOf(reading.index) }
     var anchorCharacter by remember { mutableIntStateOf(reading.character) }
     val pager = rememberPagerState { pages.size }
+    var tapAnimating by remember { mutableStateOf(false) }
+    val pageClicks = remember(reading.bytes, model.fontSize, model.fontFace) { kotlinx.coroutines.channels.Channel<Int>(kotlinx.coroutines.channels.Channel.UNLIMITED) }
+    DisposableEffect(pageClicks) { onDispose { pageClicks.close() } }
+    LaunchedEffect(pageClicks, ready) {
+        for (direction in pageClicks) {
+            if (ready && pager.pageCount > 0) {
+                val target = (pager.currentPage + direction).coerceIn(0, pager.pageCount - 1)
+                if (target != pager.currentPage) {
+                    tapAnimating = true
+                    try { pager.animateScrollToPage(target, animationSpec = androidx.compose.animation.core.tween(180)) }
+                    finally { tapAnimating = false }
+                }
+            }
+        }
+    }
     val status = DeviceStatus()
     val chapterIndices = remember(reading) { reading.chapters.map { it.paragraphIndex }.toSet() }
+    val duplicateTitles = remember(reading.paragraphs) { duplicateChapterTitles(reading.paragraphs) }
     val currentChapter by remember(reading.chapters) { derivedStateOf { chapterAt(reading.chapters, anchorParagraph) } }
     val background = if (model.night) Color(0xFF171C19) else paperColors[model.paper]
     val foreground = if (model.night) Color(0xFFD1D7D2) else Color(0xFF303730)
+    val fontContext = LocalContext.current
+    val readingFont = remember(fontContext, model.fontFace) { readerFontFamily(fontContext, model.fontFace) }
     val style = TextStyle(fontSize = model.fontSize.sp, lineHeight = (model.fontSize * 1.8f).sp,
-        fontFamily = androidx.compose.ui.text.font.FontFamily.Default, letterSpacing = 0.sp,
+        fontFamily = readingFont, letterSpacing = 0.sp,
         platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false),
         lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
             androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
@@ -530,11 +785,11 @@ private fun ColumnScope.Reader(model: ReaderModel, reading: Reading) {
         }
     }
     Surface(Modifier.fillMaxSize(), color = background, contentColor = foreground) {
-        Box(Modifier.fillMaxSize().pointerInput(ready) {
+        Box(Modifier.fillMaxSize().pointerInput(ready, pageClicks) {
             detectTapGestures { position ->
                 if (ready) when (tapRegion(position.x, size.width.toFloat())) {
-                    -1 -> { controls = false; if (pager.currentPage > 0 && !pager.isScrollInProgress) scope.launch { pager.animateScrollToPage(pager.currentPage - 1) } }
-                    1 -> { controls = false; if (pager.currentPage < pager.pageCount - 1 && !pager.isScrollInProgress) scope.launch { pager.animateScrollToPage(pager.currentPage + 1) } }
+                    -1 -> { controls = false; pageClicks.trySend(-1) }
+                    1 -> { controls = false; pageClicks.trySend(1) }
                     else -> controls = !controls
                 }
             }
@@ -549,7 +804,7 @@ private fun ColumnScope.Reader(model: ReaderModel, reading: Reading) {
                     val height = constraints.maxHeight
                     val lineHeight = with(density) { (model.fontSize * 1.8f).sp.toPx() }
                     val lineDp = with(density) { lineHeight.toDp() }
-                    LaunchedEffect(width, height, model.fontSize, density.density, density.fontScale, reading.bytes) {
+                    LaunchedEffect(width, height, model.fontSize, model.fontFace, density.density, density.fontScale, reading.bytes) {
                         if (width <= 0 || height <= 0) return@LaunchedEffect
                         val savedParagraph = anchorParagraph
                         val savedCharacter = anchorCharacter
@@ -557,11 +812,12 @@ private fun ColumnScope.Reader(model: ReaderModel, reading: Reading) {
                         try {
                             // Let fullscreen inset animations settle before choosing the cache key.
                             delay(250)
-                            val layoutKey = "pages-v3|$width|$height|${model.fontSize}|${density.density}|${density.fontScale}|${android.os.Build.FINGERPRINT}"
+                            val layoutKey = "pages-v7-taiwan-kai|${model.fontFace}|$width|$height|${model.fontSize}|${density.density}|${density.fontScale}|${android.os.Build.FINGERPRINT}"
                             val result = model.paginated(reading, layoutKey) { withContext(Dispatchers.Default) {
                                 val lines = ArrayList<ReadingLine>()
                                 reading.paragraphs.forEachIndexed { paragraphIndex, paragraph ->
                                     ensureActive()
+                                    if (paragraphIndex in duplicateTitles) return@forEachIndexed
                                     val heading = paragraphIndex in chapterIndices
                                     val layout = measurer.measure(paragraph,
                                         style = style.copy(fontWeight = if (heading) FontWeight.Bold else FontWeight.Normal),
@@ -587,8 +843,13 @@ private fun ColumnScope.Reader(model: ReaderModel, reading: Reading) {
                     }
                     if (ready) {
                         HorizontalPager(state = pager, modifier = Modifier.fillMaxSize(),
+                            beyondViewportPageCount = 1, userScrollEnabled = !tapAnimating,
                             verticalAlignment = Alignment.Top) { page ->
-                            Column(Modifier.fillMaxSize()) {
+                            Column(Modifier.fillMaxSize().zIndex(-page.toFloat()).graphicsLayer {
+                                val offset = (pager.currentPage - page) + pager.currentPageOffsetFraction
+                                translationX = if (offset < 0f) offset * size.width else 0f
+                                shadowElevation = 0f
+                            }.background(background)) {
                                 pages[page].lines.forEach { line ->
                                     Text(line.text, modifier = Modifier.fillMaxWidth().height(lineDp),
                                         style = style, fontWeight = if (line.heading) FontWeight.Bold else FontWeight.Normal,
@@ -604,10 +865,10 @@ private fun ColumnScope.Reader(model: ReaderModel, reading: Reading) {
                             CircularProgressIndicator()
                             Spacer(Modifier.height(12.dp))
                             Text("正在加载…", color = foreground)
-                            if (model.downloading && model.downloadingBook?.id == reading.book.id) {
-                                Spacer(Modifier.height(8.dp))
-                                Text("下载时进入会稍慢，请耐心等候", color = foreground.copy(alpha = 0.7f), fontSize = 13.sp)
-                            }
+                            Spacer(Modifier.height(8.dp))
+                            Text(if (model.downloading && model.downloadingBook?.id == reading.book.id)
+                                "下载时进入会稍慢，请耐心等候" else "首次进入时会较慢，请耐心等候",
+                                color = foreground.copy(alpha = 0.7f), fontSize = 13.sp)
                         }
                     }
                 }
@@ -619,15 +880,21 @@ private fun ColumnScope.Reader(model: ReaderModel, reading: Reading) {
                     Text(status, fontSize = 11.sp, color = foreground.copy(alpha = 0.65f))
                 }
             }
-            if (controls && ready) {
-                Surface(Modifier.align(Alignment.TopCenter).fillMaxWidth(), tonalElevation = 8.dp, shadowElevation = 4.dp) {
+            androidx.compose.animation.AnimatedVisibility(visible = controls && ready, modifier = Modifier.align(Alignment.TopCenter),
+                enter = fadeIn(tween(300)) + slideInVertically(tween(300)) { -it / 2 },
+                exit = fadeOut(tween(220)) + slideOutVertically(tween(220)) { -it / 2 }) {
+                Surface(Modifier.fillMaxWidth(), color = background, tonalElevation = 0.dp, shadowElevation = 0.dp) {
                     Row(Modifier.padding(8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                         TextButton(onClick = { save(); model.close() }) { Text("〈 书架") }
                         TextButton(onClick = { settings = true }) { Text("阅读设置") }
                         if ((model.availableBytes[reading.book.id] ?: 0) > reading.bytes) TextButton(onClick = { save(); model.open(reading.book) }) { Text("更新章节") }
                     }
                 }
-                Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth(), tonalElevation = 8.dp, shadowElevation = 4.dp) {
+            }
+            androidx.compose.animation.AnimatedVisibility(visible = controls && ready, modifier = Modifier.align(Alignment.BottomCenter),
+                enter = fadeIn(tween(300)) + slideInVertically(tween(300)) { it / 2 },
+                exit = fadeOut(tween(220)) + slideOutVertically(tween(220)) { it / 2 }) {
+                Surface(Modifier.fillMaxWidth(), color = background, tonalElevation = 0.dp, shadowElevation = 0.dp) {
                     Row(Modifier.padding(8.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
                         TextButton(onClick = { jump(reading.chapters[currentChapter - 1]) }, enabled = currentChapter > 0) { Text("上一章") }
                         TextButton(onClick = { contents = true }) { Text("目录") }
@@ -656,7 +923,19 @@ private fun ColumnScope.Reader(model: ReaderModel, reading: Reading) {
             }, confirmButton = { TextButton(onClick = { contents = false }) { Text("关闭") } })
     }
     if (settings) AlertDialog(onDismissRequest = { settings = false; controls = false }, title = { Text("阅读设置") }, text = {
-        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("正文字体")
+            readerFontNames.indices.toList().chunked(2).forEach { row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    row.forEach { index ->
+                        OutlinedButton(onClick = { save(); model.changeFontFace(index) }, modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 8.dp)) {
+                            Text((if (model.fontFace == index) "✓ " else "") + readerFontNames[index])
+                        }
+                    }
+                }
+            }
+            Text("清风翻书页，山月照归人。", fontFamily = readingFont, fontSize = 20.sp, lineHeight = 30.sp)
             Text("字号：${model.fontSize}")
             Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 OutlinedButton(onClick = { model.setFont(model.fontSize - 2) }, enabled = model.fontSize > 14) { Text("A−") }
@@ -856,7 +1135,7 @@ private fun OnlineBooks(model: ReaderModel) {
     val main = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
     var downloading by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(true) }
-    var address by remember { mutableStateOf("https://www.10086txt.com/") }
+    var address by remember { mutableStateOf("https://www.qishuxia.com/") }
     var linkDialog by remember { mutableStateOf(false) }
     var link by remember { mutableStateOf("") }
     var downloadJob by remember { mutableStateOf<Job?>(null) }
@@ -898,9 +1177,11 @@ private fun OnlineBooks(model: ReaderModel) {
             TextButton(onClick = { linkDialog = true }) { Text("打开链接") }
         }
         Text(Uri.parse(address).host ?: "在线找书", Modifier.padding(horizontal = 12.dp), fontSize = 12.sp, maxLines = 1)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextButton(enabled = !downloading, onClick = { web?.loadUrl("https://www.10086txt.com/") }) { Text("10086TXT") }
-            TextButton(enabled = !downloading, onClick = { web?.loadUrl("https://www.qishuxia.com/") }) { Text("奇书网") }
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Button(modifier = Modifier.weight(1f).heightIn(min = 52.dp), enabled = !downloading,
+                onClick = { web?.loadUrl("https://www.qishuxia.com/") }) { Text("奇书网", fontSize = 17.sp, fontWeight = FontWeight.Bold) }
+            FilledTonalButton(modifier = Modifier.weight(1f).heightIn(min = 52.dp), enabled = !downloading,
+                onClick = { web?.loadUrl("https://www.10086txt.com/") }) { Text("移动小说", fontSize = 17.sp, fontWeight = FontWeight.Bold) }
         }
         Text("在网页中搜索，点击 TXT 普通下载后自动加入书架。", Modifier.padding(12.dp), fontSize = 12.sp)
         if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -943,7 +1224,7 @@ private fun OnlineBooks(model: ReaderModel) {
                     val name = android.webkit.URLUtil.guessFileName(url, disposition, mime)
                     latestDownload(url, name, agent ?: settings.userAgentString)
                 }
-                loadUrl("https://www.10086txt.com/")
+                loadUrl("https://www.qishuxia.com/")
             }
         })
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {

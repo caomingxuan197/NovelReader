@@ -117,7 +117,7 @@ private suspend fun aaaGet(path: String, fields: Map<String, String>? = null): B
     } finally { connection.disconnect() }
 }
 
-private data class AaaChapter(val id: String, val title: String, val paid: Boolean)
+private data class AaaChapter(val id: String, val title: String)
 private data class AaaBook(val address: AaaAddress, val chapters: List<AaaChapter>)
 internal data class AaaSearchHit(val book: String, val site: String, val title: String, val author: String)
 internal data class AaaSearchPage(val books: List<AaaSearchHit>, val pages: Int)
@@ -172,15 +172,14 @@ private class AaaClient(private val context: Context) {
                 val chapter = array.getJSONObject(i)
                 val id = chapter.getString("cid")
                 require(id.matches(Regex("\\d+"))) { "章节编号异常。" }
-                AaaChapter(id, restoreAaa(chapter.getString("title"), mapping), chapter.optInt("vip", 0) != 0)
+                AaaChapter(id, restoreAaa(chapter.getString("title"), mapping))
             }
             require(chapters.map { it.id }.distinct().size == chapters.size) { "目录中存在重复章节编号。" }
             AaaBook(address, chapters)
         }
     }
-    suspend fun download(book: AaaBook, limit: Int, status: (String) -> Unit, publish: suspend (String) -> Unit): File {
+    suspend fun download(book: AaaBook, limit: Int, status: (String) -> Unit, publish: suspend (String, Int) -> Unit): File {
         val chapters = book.chapters.take(limit)
-        require(chapters.none { it.paid }) { "所选范围包含付费章节，下载已停止。" }
         val folder = File(context.cacheDir, "aaa-v3/${book.address.book}-${book.address.site}").apply { mkdirs() }
         val assembled = File(folder, "download.txt")
         withContext(Dispatchers.IO) { assembled.writeText("") }
@@ -194,7 +193,9 @@ private class AaaClient(private val context: Context) {
                 val body = withContext(Dispatchers.IO) { if (cached.isFile && cached.length() in 1..8_000_000) cached.readText() else null }
                     ?: run {
                         val json = JSONObject(aaaGet("/api-chapter-${book.address.book}-${book.address.site}-${chapter.id}?format=g2").toString(Charsets.UTF_8))
-                        require(json.optString("version") == "g2") { "章节格式不支持，下载已停止。" }
+                        require(json.optString("version") == "g2" && json.optString("content").isNotBlank()) {
+                            json.optString("msg").ifBlank { "网站未返回可读取的章节正文，请在网站确认该章节是否可访问。" }
+                        }
                         val mapping = mappingFor(json)
                         val text = withContext(Dispatchers.Default) { restoreAaa(aaaDecompress(json.getString("content")), mapping) }
                         require(text.isNotBlank() && !text.contains('\u0000')) { "章节内容为空或异常。" }
@@ -212,7 +213,7 @@ private class AaaClient(private val context: Context) {
                     require(assembled.length() + addition.toByteArray(Charsets.UTF_8).size <= 100L * 1024 * 1024) { "小说超过 100 MB，下载已停止。" }
                     assembled.appendText(addition)
                 }
-                publish(downloaded.joinToString("") { (chapter, body) -> "${chapter.title}\n\n$body\n\n" })
+                publish(downloaded.joinToString("") { (chapter, body) -> "${chapter.title}\n\n$body\n\n" }, downloaded.size)
                 completed += batch.size
             }
             return assembled
@@ -287,13 +288,13 @@ internal fun AaaLibrary(model: ReaderModel) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 fun download(count: Int) {
                     val title = selectedHit!!.title
-                    model.startStreaming(title) { publish, progress -> client.download(selected, count, progress, publish) }
+                    model.startStreaming(title, selectedHit!!.author, count) { publish, progress -> client.download(selected, count, progress, publish) }
                     status = "首批章节下载完成后即可开始阅读，后续章节继续下载。"
                 }
                 Button(enabled = !running && !model.busy, onClick = { download(minOf(10, selected.chapters.size)) }) { Text("先下载 10 章") }
                 OutlinedButton(enabled = !running && !model.busy, onClick = { download(selected.chapters.size) }) { Text("下载全部") }
             }
-            LazyColumn(Modifier.weight(1f)) { items(selected.chapters, key = { it.id }) { chapter -> Text(chapter.title + if (chapter.paid) "（付费）" else "", modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) } }
+            LazyColumn(Modifier.weight(1f)) { items(selected.chapters, key = { it.id }) { chapter -> Text(chapter.title, modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) } }
         }
     }
 }

@@ -2,7 +2,7 @@
 
 Android 小说阅读应用，制作者：草莓熊。
 
-本仓库保存 **1.0 版本**：`versionName = "1.0"`，`versionCode = 1`。
+本仓库保存 **1.1 版本**：`versionName = "1.1"`，`versionCode = 2`。
 
 ## 功能
 
@@ -31,10 +31,11 @@ Windows 命令行构建调试 APK：
 
 ## 版本来源
 
-核心代码、依赖和字形映射恢复自最后一份 1.0 更新包 `NovelReader-loading-rename`，项目外壳、图标及资源取自现有 Android Studio 工程。此仓库是整理后的 1.0 项目，不是当时整个工程的逐文件备份，不包含后续 1.1 的阅读动画等代码修改。
+基于原有工程整理为完整的 1.1 项目，包含最新首页布局、背景、字体选择与阅读动画。更新后正文首次使用系统默认字体，此后记住用户选择。详见 CHANGELOG.md。
 
 在线功能依赖第三方站点，站点变化可能导致功能失效。仓库不包含小说正文或用户书架数据。
 
 ## 第三方依赖
 
 本项目附带 Brotli 解码库 `app/libs/brotli-dec-0.1.2.jar`，其许可证见 [Brotli-LICENSE.txt](Brotli-LICENSE.txt)。其他依赖由 Gradle 下载。
+
