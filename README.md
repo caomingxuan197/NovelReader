@@ -2,40 +2,37 @@
 
 Android 小说阅读应用，制作者：草莓熊。
 
-本仓库保存 **1.1 版本**：`versionName = "1.1"`，`versionCode = 2`。
+当前版本 **1.2**，内部版本号 **7**，安装包名 `com.caomeixiong.yuedu`。
 
 ## 功能
 
-- 导入本地 TXT，支持常见中文编码与最大 100 MB 文件。
-- 书架管理：更改书名、删除书籍、记录阅读位置。
-- 自动识别章节与目录跳转，左右翻页，调整字号和阅读背景。
-- 阅读界面显示章节、进度、电量与时间。
-- 首页 AAA 小说搜索，下载过程中可以进入阅读。
-- 在线找书入口：奇书网、10086TXT。
+- 导入 TXT、识别目录、记录阅读位置，支持左右翻页、字体和背景设置。
+- AAA 搜书下载：最多两本同时缓存，支持后台下载、分别暂停和断点续传。
+- 未缓存完的书籍，点击阅读页中间区域展开菜单，可使用底部“继续缓存”按钮。
+- 下载进行中显示“正在缓存”，全部完成后隐藏缓存按钮；新内容可通过“更新章节”载入。
+- 书架管理、独立下载记录、关闭已完成记录、启动时检查更新。
 
-## 打开与运行
+## 开发与安装
 
-1. 下载或克隆本仓库，在 Android Studio 中选择 **Open**，打开项目根目录。
-2. 安装项目要求的 Android SDK（API 37），等待 Gradle 同步完成。
-3. 连接 Android 7.0 或以上手机，或启动模拟器，点击 **Run**。
+在 Android Studio 中打开项目根目录并同步 Gradle。需要 Android SDK 37；项目保留 Gradle Wrapper 和原有依赖版本。最低支持 Android 7.0。
 
-项目包含 Gradle Wrapper。现有构建配置使用 Gradle 9.6.0、Android Gradle Plugin 9.4.1、Kotlin 2.2.10，Gradle 的 JVM 配置指定 Java 25。建议使用支持这些版本的 Android Studio 及配套 JDK。
+本项目未包含机器本地的 `local.properties`、构建缓存、APK、签名密钥或密码。打开项目后由 Android Studio 配置本地 SDK 路径。
 
-Windows 命令行构建调试 APK：
+正式发布请使用原有 `yuedu-release.jks` 签名和 `yuedu` 别名，保持包名一致。发布优化暂时保持关闭，以避免此前正式包启动闪退的问题。
 
-```powershell
-.\gradlew.bat assembleDebug
-```
+后台缓存针对 AAA 逐章下载；备用网站的单个 TXT 下载流程未改动。强行停止、重启设备或系统后台限制会中断任务，重新打开后可继续。
 
-产物位于 `app/build/outputs/apk/debug/app-debug.apk`。发布时请自行配置并妥善保存签名密钥；仓库不含签名密钥或已打包 APK。
+## 更新发布
 
-## 版本来源
+1. 使用原签名构建并验证 APK，建议命名 `yuedu-1.2-build7.apk`。
+2. 在 GitHub 创建新 Release，标签建议 `v1.2`，上传 APK 作为附件。保留旧版标签。
+3. 确认附件可下载后，再修改下载网站的 `update.json`：版本名 `1.2`、内部版本号 `7`，使用新 APK 的真实下载地址。
+4. 同步更新网页上的版本、下载链接、大小及 SHA-256；不要在 APK 尚未发布时提前启用更新提示。
 
-基于原有工程整理为完整的 1.1 项目，包含最新首页布局、背景、字体选择与阅读动画。更新后正文首次使用系统默认字体，此后记住用户选择。详见 CHANGELOG.md。
+## 验证状态
 
-在线功能依赖第三方站点，站点变化可能导致功能失效。仓库不包含小说正文或用户书架数据。
+已进行 Kotlin/Compose 编译检查。尚未生成正式签名 APK，手机上的双书并发、后台运行和阅读页续传需打包后验证。
 
-## 第三方依赖
+## 资源
 
-本项目附带 Brotli 解码库 `app/libs/brotli-dec-0.1.2.jar`，其许可证见 [Brotli-LICENSE.txt](Brotli-LICENSE.txt)。其他依赖由 Gradle 下载。
-
+保留已有字体及依赖的许可文件（见 assets/fonts 和 Brotli-LICENSE.txt）。本仓库不对第三方字体和图片授予额外许可。

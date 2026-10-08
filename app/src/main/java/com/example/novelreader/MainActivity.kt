@@ -122,12 +122,16 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
     private val pageStore = PageCacheStore(File(app.filesDir, "pagination"))
     private val memoryPages = linkedMapOf<String, List<ReadingPage>>()
     private val bookLock = Mutex()
-    var downloadStatus by mutableStateOf(""); private set
-    var downloading by mutableStateOf(false); private set
-    var downloadingBook by mutableStateOf<Book?>(null); private set
-    var downloadTitle by mutableStateOf(""); private set
-    var cachedChapters by mutableStateOf(0); private set
-    var totalChapters by mutableStateOf(0); private set
+    val downloads = mutableStateMapOf<String, BookDownloadState>()
+    val downloading get() = downloads.values.any { it.downloading }
+    val activeDownloads get() = downloads.values.count { it.downloading }
+    private val primaryDownload get() = downloads.values.firstOrNull { it.downloading } ?: downloads.values.firstOrNull()
+    val downloadStatus get() = primaryDownload?.downloadStatus.orEmpty()
+    val downloadingBook get() = primaryDownload?.downloadingBook
+    val downloadTitle get() = primaryDownload?.downloadTitle.orEmpty()
+    val cachedChapters get() = primaryDownload?.cachedChapters ?: 0
+    val totalChapters get() = primaryDownload?.totalChapters ?: 0
+    fun isDownloading(id: String) = downloads[id]?.downloading == true
     fun readingLabel(book: Book): String = prefs.getString("${book.id}.chapterLabel", null) ?: "尚未开始阅读"
     private fun rememberChapter(id: String, paragraph: Int) {
         val current = reading?.takeIf { it.book.id == id } ?: return
@@ -136,42 +140,136 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
         prefs.edit().putString("$id.chapterLabel", label).apply()
     }
     val availableBytes = mutableStateMapOf<String, Long>()
-    private var downloadJob: Job? = null
-    fun stopDownload() { downloadJob?.cancel() }
-    fun startStreaming(title: String, author: String = "", total: Int = 0, action: suspend (suspend (String, Int) -> Unit, (String) -> Unit) -> Unit) {
-        if (downloading) { notice = "已有一本书正在下载，请先完成或停止。"; return }
-        downloading = true; downloadingBook = null; downloadStatus = "正在准备下载…"
-        downloadTitle = title; cachedChapters = 0; totalChapters = total
-        downloadJob = scope.launch {
-            val book = Book(UUID.randomUUID().toString(), title.take(100), System.currentTimeMillis(), author, total = total)
-            val file = File(folder, "${book.id}.txt")
+    private val downloadJobs = mutableMapOf<String, Job>()
+    private val preparingSources = mutableSetOf<String>()
+    private val prepareLock = Mutex()
+    fun stopDownload(id: String? = null) {
+        if (id == null) downloadJobs.values.toList().forEach { it.cancel() } else downloadJobs[id]?.cancel()
+    }
+    fun dismissDownload(id: String) {
+        if (!isDownloading(id)) {
+            downloads.remove(id)
+            prefs.edit().putStringSet("hiddenDownloads", prefs.getStringSet("hiddenDownloads", emptySet()).orEmpty() + id).apply()
+        }
+    }
+    fun resumeDownload(id: String) {
+        if (!isDownloading(id)) BookDownloadService.request(getApplication(), id)
+    }
+    fun resumeBook(book: Book) { resumeDownload(book.id) }
+    fun canResumeBook(book: Book) = book.cached < book.total && File(getApplication<Application>().filesDir, "download-requests/${book.id}.json").isFile
+    internal fun prepareDownload(selected: AaaBook, title: String, author: String, count: Int) {
+        if (activeDownloads >= 2) { notice = "最多同时下载两本，请先暂停其中一本。"; return }
+        val sourceKey = "aaa-${selected.address.book}-${selected.address.site}"
+        if (!preparingSources.add(sourceKey)) return
+        scope.launch {
+            try { prepareLock.withLock {
+                val source = "aaa-${selected.address.book}-${selected.address.site}"
+                val id = withContext(Dispatchers.IO) {
+                    prefs.getString("source.$source", null) ?: run {
+                        // Old releases did not store source IDs. Reuse only a unique matching
+                        // book whose saved chapter headings agree with the selected catalogue.
+                        val candidates = books.filter { it.title == title && it.author == author && it.cached > 0 && !it.id.startsWith("aaa-") }
+                        require(candidates.size <= 1) { "书架里已有多本同名缓存。请保留需要续传的一本，移除重复项后再试。" }
+                        val legacy = candidates.singleOrNull()?.takeIf { candidate ->
+                            val txt = File(folder, "${candidate.id}.txt")
+                            if (!txt.isFile || candidate.cached > selected.chapters.size) false
+                            else {
+                                val text = txt.readText()
+                                var offset = 0
+                                selected.chapters.take(candidate.cached).all { chapter ->
+                                    val marker = chapter.title + "\n\n"
+                                    val found = text.indexOf(marker, offset)
+                                    val valid = found >= 0 && (found == 0 || text[found - 1] == '\n')
+                                    if (valid) offset = found + marker.length
+                                    valid
+                                }
+                            }
+                        }
+                        require(candidates.isEmpty() || legacy != null) { "旧书章节与当前目录不一致，已保留原书并停止，避免重复建书。" }
+                        val chosen = legacy?.id ?: source
+                        if (legacy != null) {
+                            val metadata = File(folder, "$chosen.json")
+                            val json = JSONObject(android.util.AtomicFile(metadata).openRead().bufferedReader().use { it.readText() })
+                            json.put("bytes", File(folder, "$chosen.txt").length())
+                            writeDownloadJson(metadata, json)
+                        }
+                        check(prefs.edit().putString("source.$source", chosen).commit()) { "无法保存书籍来源" }
+                        chosen
+                    }
+                }
+                if (isDownloading(id)) { notice = "这本书已经在下载。"; return@withLock }
+                withContext(Dispatchers.IO) {
+                    val request = DownloadRequest(selected, title, author, count)
+                    val old = DownloadRequest.read(getApplication(), id)
+                    val meta = android.util.AtomicFile(File(folder, "$id.json"))
+                    val cached = runCatching { JSONObject(meta.openRead().bufferedReader().use { it.readText() }).optInt("cached") }.getOrDefault(0)
+                    require(old == null || old.book.chapters.take(cached).map { it.id } == selected.chapters.take(cached).map { it.id }) {
+                        "网站目录顺序发生变化，请保留原书，暂不能续传。"
+                    }
+                    request.copy(count = maxOf(count, cached)).save(getApplication(), id)
+                }
+                BookDownloadService.request(getApplication(), id)
+            } } catch (e: Exception) { error = e.message ?: "无法开始下载" }
+            finally { preparingSources.remove(sourceKey) }
+        }
+    }
+    fun runDownload(id: String) {
+        if (isDownloading(id)) return
+        if (activeDownloads >= 2) { notice = "最多同时下载两本，请先暂停其中一本。"; return }
+        val state = downloads.getOrPut(id) { BookDownloadState(id) }
+        state.downloading = true
+        state.resumableId = id
+        state.downloadStatus = "正在准备下载…"
+        prefs.edit().putStringSet("hiddenDownloads", prefs.getStringSet("hiddenDownloads", emptySet()).orEmpty() - id).apply()
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                action({ addition, addedChapters ->
-                    val length = bookLock.withLock { withContext(Dispatchers.IO) {
-                        require(file.length() + addition.toByteArray(Charsets.UTF_8).size <= MAX_BYTES) { "小说超过 100 MB。" }
+                val request = withContext(Dispatchers.IO) { DownloadRequest.read(getApplication(), id) ?: error("找不到下载记录") }
+                val file = File(folder, "$id.txt")
+                val metadata = File(folder, "$id.json")
+                val json = withContext(Dispatchers.IO) {
+                    val atomic = android.util.AtomicFile(metadata)
+                    val data = if (metadata.exists() || File(metadata.path + ".bak").exists())
+                        JSONObject(atomic.openRead().bufferedReader().use { it.readText() })
+                    else JSONObject().put("title", request.title).put("added", System.currentTimeMillis()).put("cached", 0).put("bytes", 0)
+                    val committed = data.optLong("bytes", 0)
+                    require(file.length() >= committed) { "已保存的正文不完整，无法续传。" }
+                    java.io.RandomAccessFile(file, "rw").use { it.setLength(committed) }
+                    data
+                }
+                val book = Book(id, json.getString("title"), json.getLong("added"), request.author, json.optInt("cached"), request.count)
+                state.downloadingBook = book; state.downloadTitle = book.title
+                state.cachedChapters = book.cached; state.totalChapters = request.count
+                AaaClient(getApplication()).download(request.book, request.count, { state.downloadStatus = it }, { addition, added ->
+                    // Commit bytes and checkpoint together; recover any uncommitted tail after a process kill.
+                    val length = bookLock.withLock { withContext(NonCancellable + Dispatchers.IO) {
                         val original = file.length()
-                        try { file.appendText(addition) }
-                        catch (e: Exception) { java.io.RandomAccessFile(file, "rw").use { it.setLength(original) }; throw e }
-                        val metadata = File(folder, "${book.id}.json")
-                        val json = if (metadata.exists()) JSONObject(metadata.readText()) else JSONObject().put("title", book.title).put("added", book.added)
-                        val count = cachedChapters + addedChapters
-                        json.put("author", author).put("cached", count).put("total", total)
-                        val atomic = android.util.AtomicFile(metadata)
-                        val stream = atomic.startWrite()
-                        try { stream.write(json.toString().toByteArray(Charsets.UTF_8)); atomic.finishWrite(stream) }
-                        catch (e: Exception) { atomic.failWrite(stream); throw e }
+                        val bytes = addition.toByteArray(Charsets.UTF_8)
+                        require(original + bytes.size <= MAX_BYTES) { "小说超过 100 MB。" }
+                        val data = if (metadata.exists()) JSONObject(android.util.AtomicFile(metadata).openRead().bufferedReader().use { it.readText() }) else json
+                        try {
+                            java.io.FileOutputStream(file, true).use { it.write(bytes); it.fd.sync() }
+                            data.put("author", request.author).put("cached", state.cachedChapters + added).put("total", request.count).put("bytes", file.length())
+                            writeDownloadJson(metadata, data)
+                        } catch (e: Exception) {
+                            java.io.RandomAccessFile(file, "rw").use { it.setLength(original) }
+                            throw e
+                        }
                         file.length()
                     } }
-                    availableBytes[book.id] = length
-                    cachedChapters += addedChapters
-                    if (downloadingBook?.id != book.id) downloadingBook = book
+                    availableBytes[id] = length
+                    state.cachedChapters += added
                     refresh()
-                }, { downloadStatus = it })
-                downloadStatus = "下载完成：${downloadingBook?.title ?: book.title}"
-            } catch (e: CancellationException) { downloadStatus = "下载已停止，已下载内容仍可阅读。"; throw e }
-            catch (e: Exception) { downloadStatus = "下载中断：${e.message}。已下载内容已保留。" }
-            finally { downloading = false; downloadJob = null }
+                }, book.cached)
+                state.downloadStatus = "下载完成：${state.downloadingBook?.title ?: book.title}"
+                state.resumableId = ""
+            } catch (e: CancellationException) {
+                state.downloadStatus = "下载已暂停，点击继续下载可接着缓存。"
+                throw e
+            } catch (e: Exception) { state.downloadStatus = "下载中断：${e.message}，可点击继续下载。" }
+            finally { state.downloading = false; downloadJobs.remove(id) }
         }
+        downloadJobs[id] = job
+        job.start()
     }
     suspend fun paginated(reading: Reading, layout: String, build: suspend () -> List<ReadingPage>): List<ReadingPage> {
         val file = File(folder, "${reading.book.id}.txt")
@@ -198,7 +296,25 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
     var paper by mutableStateOf(prefs.getInt("paper", 0).coerceIn(0, 4)); private set
     fun changePaper(value: Int) { paper = value.coerceIn(0, 4); prefs.edit().putInt("paper", paper).apply(); changeNight(false) }
 
-    init { task { refresh() } }
+    init { task {
+        refresh()
+        val restored = withContext(Dispatchers.IO) {
+            File(getApplication<Application>().filesDir, "download-requests").listFiles().orEmpty()
+                .filter { it.extension == "json" }.mapNotNull { file ->
+                    runCatching { DownloadRequest.read(getApplication(), file.nameWithoutExtension)?.let { file.nameWithoutExtension to it } }.getOrNull()
+                }
+        }
+        val hidden = prefs.getStringSet("hiddenDownloads", emptySet()).orEmpty()
+        for ((id, request) in restored) if (id !in hidden && id !in downloads) {
+            val book = books.find { it.id == id }
+            downloads[id] = BookDownloadState(id).apply {
+                downloadingBook = book; downloadTitle = book?.title ?: request.title
+                cachedChapters = book?.cached ?: 0; totalChapters = request.count
+                resumableId = if (cachedChapters < totalChapters) id else ""
+                downloadStatus = if (resumableId.isNotBlank()) "下载已暂停，可继续下载。" else "下载完成：$downloadTitle"
+            }
+        }
+    } }
     private fun task(action: suspend () -> Unit) {
         if (busy) return
         scope.launch {
@@ -316,12 +432,12 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
             } catch (e: Exception) { atomic.failWrite(output); throw e }
         } }
         val updated = book.copy(title = title)
-        if (downloadingBook?.id == book.id) downloadingBook = updated
+        downloads[book.id]?.let { it.downloadingBook = updated; it.downloadTitle = title }
         reading?.takeIf { it.book.id == book.id }?.let { reading = it.copy(book = updated) }
         refresh()
     }
     fun delete(book: Book) = task {
-        require(!downloading || downloadingBook?.id != book.id) { "请先停止这本书的下载，再删除。" }
+        require(!isDownloading(book.id)) { "请先停止这本书的下载，再删除。" }
         withContext(Dispatchers.IO) {
             val metadata = File(folder, "${book.id}.json")
             check(!metadata.exists() || metadata.delete()) { "删除失败，请重试。" }
@@ -330,6 +446,11 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
             prefs.edit().remove("${book.id}.index").remove("${book.id}.offset").remove("${book.id}.character").remove("${book.id}.chapterLabel").apply()
         }
         memoryPages.keys.filter { it.startsWith("${book.id}|") }.forEach { memoryPages.remove(it) }
+        downloads.remove(book.id)
+        withContext(Dispatchers.IO) {
+            val requestFile = File(getApplication<Application>().filesDir, "download-requests/${book.id}.json")
+            android.util.AtomicFile(requestFile).delete()
+        }
         refresh()
     }
     fun changeNight(value: Boolean) { night = value; prefs.edit().putBoolean("night", value).apply() }
@@ -355,8 +476,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        val model = ViewModelProvider(this)[ReaderModel::class.java]
+        val model = ReaderRuntime.get(application)
+        if (android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 900)
         setContent { ReaderApp(model) }
+        if (savedInstanceState == null) checkAppUpdate()
     }
 }
 
@@ -401,7 +524,7 @@ private fun WelcomeScreen() {
                 Spacer(Modifier.height(22.dp))
                 Text("把故事留在身边", color = ink.copy(alpha=.7f), fontSize = 15.sp, letterSpacing = 4.sp)
             }
-            Text("悦读 · 1.1\n制作者：草莓熊", Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom=24.dp), color=ink.copy(alpha=.7f), fontSize=12.sp, lineHeight=24.sp, textAlign=androidx.compose.ui.text.style.TextAlign.Center)
+            Text("悦读 · 1.2\n制作者：草莓熊", Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom=24.dp), color=ink.copy(alpha=.7f), fontSize=12.sp, lineHeight=24.sp, textAlign=androidx.compose.ui.text.style.TextAlign.Center)
         }
     }
 }
@@ -499,23 +622,27 @@ private fun Shelf(model: ReaderModel) {
                         colors = ButtonDefaults.filledTonalButtonColors(containerColor = soft, contentColor = green)) { Text("导入 TXT") }
                 }
             }
-            if (model.downloadStatus.isNotBlank()) item {
+            items(model.downloads.values.toList(), key = { "download-${it.id}" }) { download ->
                 Surface(color = card, shape = round, modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(if (model.downloading) "正在缓存《${model.downloadingBook?.title ?: model.downloadTitle}》" else "下载记录",
+                            Text(if (download.downloading) "正在缓存《${download.downloadingBook?.title ?: download.downloadTitle}》" else "下载记录 · ${download.downloadTitle}",
                                 Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
-                            if (model.downloading) TextButton(onClick = { model.stopDownload() }) { Text("停止", color = green) }
+                            if (download.downloading) TextButton(onClick = { model.stopDownload(download.id) }) { Text("暂停", color = green) }
+                            else {
+                                if (download.resumableId.isNotBlank()) TextButton(onClick = { model.resumeDownload(download.id) }) { Text("继续下载", color = green) }
+                                TextButton(onClick = { model.dismissDownload(download.id) }) { Text("关闭", color = muted) }
+                            }
                         }
-                        if (model.totalChapters > 0) {
-                            val fraction = (model.cachedChapters.toFloat() / model.totalChapters).coerceIn(0f, 1f)
+                        if (download.totalChapters > 0) {
+                            val fraction = (download.cachedChapters.toFloat() / download.totalChapters).coerceIn(0f, 1f)
                             LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth(), color = green, trackColor = soft)
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                Text("${model.cachedChapters} / ${model.totalChapters} 章", fontSize = 12.sp, color = muted)
+                                Text("${download.cachedChapters} / ${download.totalChapters} 章", fontSize = 12.sp, color = muted)
                                 Text("${(fraction * 100).toInt()}%", fontSize = 12.sp, color = muted)
                             }
                         }
-                        if (!model.downloading || model.totalChapters == 0) Text(model.downloadStatus, fontSize = 12.sp, color = muted)
+                        if (!download.downloading || download.totalChapters == 0) Text(download.downloadStatus, fontSize = 12.sp, color = muted)
                     }
                 }
             }
@@ -559,10 +686,13 @@ private fun Shelf(model: ReaderModel) {
                                 Text("⋮", fontSize = 24.sp, color = muted)
                             }
                             DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                                if (model.canResumeBook(book)) DropdownMenuItem(
+                                    text = { Text("继续下载") }, enabled = model.activeDownloads < 2 && !model.isDownloading(book.id),
+                                    onClick = { expanded = false; model.resumeBook(book) })
                                 DropdownMenuItem(text = { Text("更改书名") }, onClick = { expanded = false; newTitle = book.title; renaming = book })
                                 DropdownMenuItem(text = { Text("书籍信息") }, onClick = { expanded = false; information = book })
                                 DropdownMenuItem(text = { Text("删除", color = Color(0xFFB8655B)) },
-                                    enabled = !model.downloading || model.downloadingBook?.id != book.id,
+                                    enabled = !model.isDownloading(book.id),
                                     onClick = { expanded = false; deleting = book })
                             }
                         }
@@ -581,7 +711,7 @@ private fun Shelf(model: ReaderModel) {
     }
     }
     if (about) AlertDialog(onDismissRequest = { about = false }, title = { Text("关于悦读") },
-        text = { Text("把故事留在身边\n\n版本 1.1\n制作者：草莓熊") },
+        text = { Text("把故事留在身边\n\n版本 1.2\n制作者：草莓熊") },
         confirmButton = { TextButton(onClick = { about = false }) { Text("知道了") } })
     information?.let { book -> AlertDialog(onDismissRequest = { information = null }, title = { Text(book.title) },
         text = { Text("作者：${book.author.ifBlank { "暂无信息" }}\n${model.readingLabel(book)}\n" +
@@ -866,7 +996,7 @@ private fun ColumnScope.Reader(model: ReaderModel, reading: Reading) {
                             Spacer(Modifier.height(12.dp))
                             Text("正在加载…", color = foreground)
                             Spacer(Modifier.height(8.dp))
-                            Text(if (model.downloading && model.downloadingBook?.id == reading.book.id)
+                            Text(if (model.isDownloading(reading.book.id))
                                 "下载时进入会稍慢，请耐心等候" else "首次进入时会较慢，请耐心等候",
                                 color = foreground.copy(alpha = 0.7f), fontSize = 13.sp)
                         }
@@ -874,7 +1004,7 @@ private fun ColumnScope.Reader(model: ReaderModel, reading: Reading) {
                 }
                 Row(Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                     val progress = if (ready && pages.isNotEmpty()) ((pager.settledPage + 1) * 100f / pages.size) else null
-                    val progressLabel = if ((model.downloading && model.downloadingBook?.id == reading.book.id) || (model.availableBytes[reading.book.id] ?: 0) > reading.bytes) "已载入内容" else "阅读进度"
+                    val progressLabel = if ((model.isDownloading(reading.book.id)) || (model.availableBytes[reading.book.id] ?: 0) > reading.bytes) "已载入内容" else "阅读进度"
                     Text(if (progress == null) "$progressLabel —" else "$progressLabel ${String.format(java.util.Locale.ROOT, "%.1f", progress)}%",
                         fontSize = 11.sp, color = foreground.copy(alpha = 0.65f))
                     Text(status, fontSize = 11.sp, color = foreground.copy(alpha = 0.65f))
@@ -895,11 +1025,29 @@ private fun ColumnScope.Reader(model: ReaderModel, reading: Reading) {
                 enter = fadeIn(tween(300)) + slideInVertically(tween(300)) { it / 2 },
                 exit = fadeOut(tween(220)) + slideOutVertically(tween(220)) { it / 2 }) {
                 Surface(Modifier.fillMaxWidth(), color = background, tonalElevation = 0.dp, shadowElevation = 0.dp) {
-                    Row(Modifier.padding(8.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    Column {
+                        val latestBook = model.books.firstOrNull { it.id == reading.book.id } ?: reading.book
+                        val currentDownload = model.downloads[reading.book.id]
+                        val cached = maxOf(latestBook.cached, currentDownload?.cachedChapters ?: 0)
+                        val total = maxOf(latestBook.total, currentDownload?.totalChapters ?: 0)
+                        if (total > 0 && cached < total) {
+                            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically) {
+                                Text("已缓存 $cached / $total 章", fontSize = 12.sp)
+                                val active = model.isDownloading(latestBook.id)
+                                TextButton(enabled = !active, onClick = {
+                                    if (model.canResumeBook(latestBook.copy(cached = cached, total = total))) model.resumeBook(latestBook)
+                                    else model.notice = "这本旧书没有可用的下载来源记录，请在首页搜索同一本书，再尝试续传。"
+                                }) { Text(if (active) "正在缓存" else "继续缓存") }
+                            }
+                        }
+                    Row(Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
                         TextButton(onClick = { jump(reading.chapters[currentChapter - 1]) }, enabled = currentChapter > 0) { Text("上一章") }
                         TextButton(onClick = { contents = true }) { Text("目录") }
                         TextButton(onClick = { jump(reading.chapters[currentChapter + 1]) },
                             enabled = currentChapter < reading.chapters.lastIndex) { Text("下一章") }
+                    }
                     }
                 }
             }

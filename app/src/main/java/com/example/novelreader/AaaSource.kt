@@ -117,8 +117,8 @@ private suspend fun aaaGet(path: String, fields: Map<String, String>? = null): B
     } finally { connection.disconnect() }
 }
 
-private data class AaaChapter(val id: String, val title: String)
-private data class AaaBook(val address: AaaAddress, val chapters: List<AaaChapter>)
+internal data class AaaChapter(val id: String, val title: String)
+internal data class AaaBook(val address: AaaAddress, val chapters: List<AaaChapter>)
 internal data class AaaSearchHit(val book: String, val site: String, val title: String, val author: String)
 internal data class AaaSearchPage(val books: List<AaaSearchHit>, val pages: Int)
 internal fun parseAaaSearch(response: String): AaaSearchPage {
@@ -139,7 +139,7 @@ internal fun parseAaaSearch(response: String): AaaSearchPage {
     }.distinctBy { "${it.book}-${it.site}" }
     return AaaSearchPage(hits, data.getInt("total_pages").coerceIn(0, 1000))
 }
-private class AaaClient(private val context: Context) {
+internal class AaaClient(private val context: Context) {
     suspend fun search(keyword: String, page: Int): AaaSearchPage {
         require(keyword.trim().length in 1..100 && page in 1..1000) { "请输入 1～100 个字的书名或作者。" }
         val bytes = aaaGet("/api-search", mapOf("keyword" to keyword.trim(), "page" to page.toString(), "size" to "10"))
@@ -178,14 +178,14 @@ private class AaaClient(private val context: Context) {
             AaaBook(address, chapters)
         }
     }
-    suspend fun download(book: AaaBook, limit: Int, status: (String) -> Unit, publish: suspend (String, Int) -> Unit): File {
+    suspend fun download(book: AaaBook, limit: Int, status: (String) -> Unit, publish: suspend (String, Int) -> Unit, completedChapters: Int = 0): File {
         val chapters = book.chapters.take(limit)
         val folder = File(context.cacheDir, "aaa-v3/${book.address.book}-${book.address.site}").apply { mkdirs() }
         val assembled = File(folder, "download.txt")
         withContext(Dispatchers.IO) { assembled.writeText("") }
         try {
-            var completed = 0
-            for (batch in chapters.chunked(2)) {
+            var completed = completedChapters
+            for (batch in chapters.drop(completedChapters).chunked(2)) {
                 currentCoroutineContext().ensureActive()
                 status("正在下载 ${completed + 1}～${completed + batch.size}/${chapters.size}")
                 val downloaded = coroutineScope { batch.map { chapter -> async {
@@ -234,7 +234,7 @@ internal fun AaaLibrary(model: ReaderModel) {
     var book by remember { mutableStateOf<AaaBook?>(null) }
     var job by remember { mutableStateOf<Job?>(null) }
     var status by remember { mutableStateOf("输入书名或作者，搜索后选择书籍下载。") }
-    val running = job?.isActive == true || model.downloading
+    val running = job?.isActive == true
     fun start(action: suspend () -> Unit) {
         job = scope.launch {
             try { action() }
@@ -269,7 +269,7 @@ internal fun AaaLibrary(model: ReaderModel) {
         model.downloadingBook?.let { readyBook ->
             Button(onClick = { model.aaaOnline = false; model.open(readyBook) }, enabled = !model.busy) { Text("立即阅读已下载内容") }
         }
-        if (running) { LinearProgressIndicator(Modifier.fillMaxWidth()); TextButton(onClick = { job?.cancel(); model.stopDownload() }) { Text("停止") } }
+        if (running) { LinearProgressIndicator(Modifier.fillMaxWidth()); TextButton(onClick = { job?.cancel() }) { Text("停止") } }
         if (selectedHit == null) results?.let { found ->
             LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(found.books, key = { "${it.book}-${it.site}" }) { hit ->
@@ -288,11 +288,11 @@ internal fun AaaLibrary(model: ReaderModel) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 fun download(count: Int) {
                     val title = selectedHit!!.title
-                    model.startStreaming(title, selectedHit!!.author, count) { publish, progress -> client.download(selected, count, progress, publish) }
+                    model.prepareDownload(selected, title, selectedHit!!.author, count)
                     status = "首批章节下载完成后即可开始阅读，后续章节继续下载。"
                 }
-                Button(enabled = !running && !model.busy, onClick = { download(minOf(10, selected.chapters.size)) }) { Text("先下载 10 章") }
-                OutlinedButton(enabled = !running && !model.busy, onClick = { download(selected.chapters.size) }) { Text("下载全部") }
+                Button(enabled = !running && !model.busy && model.activeDownloads < 2, onClick = { download(minOf(10, selected.chapters.size)) }) { Text("先下载 10 章") }
+                OutlinedButton(enabled = !running && !model.busy && model.activeDownloads < 2, onClick = { download(selected.chapters.size) }) { Text("下载全部") }
             }
             LazyColumn(Modifier.weight(1f)) { items(selected.chapters, key = { it.id }) { chapter -> Text(chapter.title, modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) } }
         }
