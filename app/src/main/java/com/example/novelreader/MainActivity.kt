@@ -237,6 +237,7 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
                     data
                 }
                 val book = Book(id, json.getString("title"), json.getLong("added"), request.author, json.optInt("cached"), request.count)
+                var coverRequested = false
                 state.downloadingBook = book; state.downloadTitle = book.title
                 state.cachedChapters = book.cached; state.totalChapters = request.count
                 AaaClient(getApplication()).download(request.book, request.count, { state.downloadStatus = it }, { addition, added ->
@@ -259,6 +260,14 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
                     availableBytes[id] = length
                     state.cachedChapters += added
                     refresh()
+                    if (!coverRequested) {
+                        coverRequested = true
+                        scope.launch {
+                            try { savedBookCover(getApplication(), id) }
+                            catch (e: CancellationException) { throw e }
+                            catch (_: Exception) { /* A cover failure must not interrupt the book download. */ }
+                        }
+                    }
                 }, book.cached)
                 state.downloadStatus = "下载完成：${state.downloadingBook?.title ?: book.title}"
                 state.resumableId = ""
@@ -273,7 +282,7 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
     }
     suspend fun paginated(reading: Reading, layout: String, build: suspend () -> List<ReadingPage>): List<ReadingPage> {
         val file = File(folder, "${reading.book.id}.txt")
-        val key = "${reading.book.id}|${reading.bytes}|$layout"
+        val key = "${reading.book.id}|${reading.bytes}|$layout|${if (reading.book.id.endsWith("-qishu")) "clean-p-v1" else "original"}"
         memoryPages[key]?.let { return it }
         val cached = withContext(Dispatchers.IO) { pageStore.read(key) }
         val result = cached ?: build().also { pages -> withContext(Dispatchers.IO) { pageStore.write(key, pages) } }
@@ -397,8 +406,10 @@ class ReaderModel(app: Application) : AndroidViewModel(app) {
     fun open(book: Book) = task {
         val snapshot = bookLock.withLock { withContext(Dispatchers.IO) {
             val file = File(folder, "${book.id}.txt")
+            val isQishu = book.id.endsWith("-qishu")
             val paragraphs = file.useLines { lines ->
-                lines.filter { it.isNotBlank() }.flatMap { it.trim().chunked(1000).asSequence() }.toList()
+                lines.flatMap { (if (isQishu) cleanQishuParagraphTags(it) else it).lineSequence() }
+                    .filter { it.isNotBlank() }.flatMap { it.trim().chunked(1000).asSequence() }.toList()
             }
             paragraphs to file.length()
         } }
@@ -524,13 +535,17 @@ private fun WelcomeScreen() {
                 Spacer(Modifier.height(22.dp))
                 Text("把故事留在身边", color = ink.copy(alpha=.7f), fontSize = 15.sp, letterSpacing = 4.sp)
             }
-            Text("悦读 · 1.2\n制作者：草莓熊", Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom=24.dp), color=ink.copy(alpha=.7f), fontSize=12.sp, lineHeight=24.sp, textAlign=androidx.compose.ui.text.style.TextAlign.Center)
+            Text("悦读 · 1.3\n制作者：草莓熊", Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom=24.dp), color=ink.copy(alpha=.7f), fontSize=12.sp, lineHeight=24.sp, textAlign=androidx.compose.ui.text.style.TextAlign.Center)
         }
     }
 }
 
 @Composable
 private fun ReaderApp(model: ReaderModel) {
+    var storeTab by rememberSaveable { mutableStateOf(false) }
+    val storeState = remember { AaaStoreState() }
+    val storeScope = rememberCoroutineScope()
+    var storeSelection by remember { mutableStateOf<AaaSearchHit?>(null) }
     var welcome by rememberSaveable { mutableStateOf(true) }
     LaunchedEffect(Unit) { delay(1500); welcome = false }
     if (welcome) { WelcomeScreen(); return }
@@ -540,9 +555,24 @@ private fun ReaderApp(model: ReaderModel) {
         Surface(Modifier.fillMaxSize(), color = colors.background) {
             Column(Modifier.fillMaxSize().safeDrawingPadding()) {
                 val reading = model.reading
-                if (model.aaaOnline) AaaLibrary(model)
+                if (model.aaaOnline) AaaLibrary(model, storeSelection) { model.aaaOnline = false; storeSelection = null }
                 else if (model.online) OnlineBooks(model)
-                else if (reading == null) Shelf(model) else key(reading.book.id) { Reader(model, reading) }
+                else if (reading == null) {
+                    BackHandler(enabled = storeTab) { storeTab = false }
+                    Box(Modifier.weight(1f)) {
+                        if (storeTab) AaaStorePane(storeState, storeScope, Modifier.fillMaxSize().padding(12.dp)) { hit ->
+                            storeSelection = hit; model.aaaOnline = true
+                        } else Shelf(model)
+                    }
+                    Surface(color = colors.surface, tonalElevation = 2.dp) {
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                            FilledTonalButton(onClick = { storeTab = false }, modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.filledTonalButtonColors(containerColor = if (!storeTab) colors.primaryContainer else Color.Transparent)) { Text("主页") }
+                            FilledTonalButton(onClick = { storeTab = true }, modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.filledTonalButtonColors(containerColor = if (storeTab) colors.primaryContainer else Color.Transparent)) { Text("书城") }
+                        }
+                    }
+                } else key(reading.book.id) { Reader(model, reading) }
             }
             if (model.busy) AlertDialog(onDismissRequest = {}, confirmButton = {},
                 title = { Text("正在处理") }, text = { Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -668,10 +698,12 @@ private fun Shelf(model: ReaderModel) {
                     colors = CardDefaults.cardColors(containerColor = card, contentColor = ink)) {
                     Row(Modifier.padding(start = 14.dp, top = 16.dp, end = 4.dp, bottom = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Surface(Modifier.size(width = 70.dp, height = 102.dp), color = soft, shape = RoundedCornerShape(8.dp)) {
+                            SavedBookCover(book.id, book.title) {
                             Column(Modifier.padding(9.dp), verticalArrangement = Arrangement.SpaceBetween) {
                                 Text(book.title, color = green, fontFamily = titleFont, fontSize = 17.sp,
                                     lineHeight = 23.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
                                 Text("悦读", color = muted, fontSize = 9.sp)
+                            }
                             }
                         }
                         Column(Modifier.weight(1f).padding(top = 2.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -711,7 +743,7 @@ private fun Shelf(model: ReaderModel) {
     }
     }
     if (about) AlertDialog(onDismissRequest = { about = false }, title = { Text("关于悦读") },
-        text = { Text("把故事留在身边\n\n版本 1.2\n制作者：草莓熊") },
+        text = { Text("把故事留在身边\n\n版本 1.3\n制作者：草莓熊") },
         confirmButton = { TextButton(onClick = { about = false }) { Text("知道了") } })
     information?.let { book -> AlertDialog(onDismissRequest = { information = null }, title = { Text(book.title) },
         text = { Text("作者：${book.author.ifBlank { "暂无信息" }}\n${model.readingLabel(book)}\n" +
@@ -1146,10 +1178,7 @@ private suspend fun downloadTxt(url: String, userAgent: String, referer: String)
                 check(code == 200) { "下载失败（$code），请回到网盘页面重试。" }
                 require(connection.contentLengthLong <= MAX_BYTES) { "当前支持最大 100 MB 的 TXT 文件。" }
                 val disposition = connection.getHeaderField("Content-Disposition") ?: ""
-                val encoded = Regex("filename\\*=UTF-8''([^;]+)", RegexOption.IGNORE_CASE).find(disposition)?.groupValues?.get(1)
-                val name = (encoded?.let { java.net.URLDecoder.decode(it.trim(), "UTF-8") }
-                    ?: android.webkit.URLUtil.guessFileName(address.toString(), disposition, connection.contentType))
-                    .substringAfterLast('/').substringAfterLast('\\')
+                val name = downloadedFileName(address.toString(), disposition)
                 val output = java.io.ByteArrayOutputStream()
                 connection.inputStream.use { input ->
                     val buffer = ByteArray(8192)
@@ -1277,13 +1306,13 @@ private val fileSaveAdapter = """
 
 @android.annotation.SuppressLint("SetJavaScriptEnabled")
 @Composable
-private fun OnlineBooks(model: ReaderModel) {
+internal fun OnlineBooks(model: ReaderModel, initialUrl: String = "https://www.qishuxia.com/", onExit: () -> Unit = { model.online = false }) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val main = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
     var downloading by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(true) }
-    var address by remember { mutableStateOf("https://www.qishuxia.com/") }
+    var address by remember { mutableStateOf(initialUrl) }
     var linkDialog by remember { mutableStateOf(false) }
     var link by remember { mutableStateOf("") }
     var downloadJob by remember { mutableStateOf<Job?>(null) }
@@ -1310,7 +1339,7 @@ private fun OnlineBooks(model: ReaderModel) {
         }
     }
     val latestDownload by rememberUpdatedState(startDownload)
-    BackHandler { if (downloading) downloadJob?.cancel() else if (web?.canGoBack() == true) web?.goBack() else model.online = false }
+    BackHandler { if (downloading) downloadJob?.cancel() else if (web?.canGoBack() == true) web?.goBack() else onExit() }
     DisposableEffect(Unit) {
         onDispose {
             downloadJob?.cancel()
@@ -1320,7 +1349,7 @@ private fun OnlineBooks(model: ReaderModel) {
     }
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            TextButton(onClick = { model.online = false }) { Text("〈 书架") }
+            TextButton(onClick = { onExit() }) { Text(if (initialUrl == "https://www.qishuxia.com/") "〈 书架" else "〈 返回搜索") }
             TextButton(onClick = { web?.goBack() }) { Text("网页返回") }
             TextButton(onClick = { linkDialog = true }) { Text("打开链接") }
         }
@@ -1369,10 +1398,10 @@ private fun OnlineBooks(model: ReaderModel) {
                     }
                 }
                 setDownloadListener { url, agent, disposition, mime, _ ->
-                    val name = android.webkit.URLUtil.guessFileName(url, disposition, mime)
+                    val name = downloadedFileName(url, disposition)
                     latestDownload(url, name, agent ?: settings.userAgentString)
                 }
-                loadUrl("https://www.qishuxia.com/")
+                loadUrl(initialUrl)
             }
         })
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
@@ -1515,4 +1544,5 @@ internal fun transcodeNovelFile(source: File, destination: File) {
         }
     }
 }
+
 

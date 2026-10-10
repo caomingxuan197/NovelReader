@@ -32,7 +32,7 @@ internal data class DownloadRequest(val book: AaaBook, val title: String, val au
     }
     companion object {
         private fun path(context: Context, id: String): File {
-            require(Regex("(?:aaa-\\d+-\\d+|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})").matches(id))
+            require(Regex("(?:aaa-\\d+-(?:\\d+|qishu|baoshu)|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})").matches(id))
             return File(File(context.filesDir, "download-requests").apply { mkdirs() }, "$id.json")
         }
         fun read(context: Context, id: String): DownloadRequest? {
@@ -118,3 +118,4 @@ class BookDownloadService : Service() {
         }
     }
 }
+

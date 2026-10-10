@@ -80,7 +80,7 @@ internal fun restoreAaa(text: String, mapping: Map<Char, Char>): String {
     }
 }
 
-private suspend fun aaaGet(path: String, fields: Map<String, String>? = null): ByteArray = withContext(Dispatchers.IO) {
+internal suspend fun aaaGet(path: String, fields: Map<String, String>? = null): ByteArray = withContext(Dispatchers.IO) {
     require(path.startsWith("/api-") || Regex("^/static/fonts/[a-f0-9]{48}\\.woff2$").matches(path))
     val connection = URL("https://www.aaawz.cc$path").openConnection() as javax.net.ssl.HttpsURLConnection
     try {
@@ -192,12 +192,17 @@ internal class AaaClient(private val context: Context) {
                 val cached = File(folder, "${chapter.id}.txt")
                 val body = withContext(Dispatchers.IO) { if (cached.isFile && cached.length() in 1..8_000_000) cached.readText() else null }
                     ?: run {
+                        val text = if (book.address.site == "baoshu") baoshuBody(chapter.id) else if (book.address.site == "qishu") {
+                            val html = qishuHtml("/book/${book.address.book}/${chapter.id}.html")
+                            withContext(Dispatchers.Default) { parseQishuBody(html) }
+                        } else {
                         val json = JSONObject(aaaGet("/api-chapter-${book.address.book}-${book.address.site}-${chapter.id}?format=g2").toString(Charsets.UTF_8))
                         require(json.optString("version") == "g2" && json.optString("content").isNotBlank()) {
                             json.optString("msg").ifBlank { "网站未返回可读取的章节正文，请在网站确认该章节是否可访问。" }
                         }
                         val mapping = mappingFor(json)
-                        val text = withContext(Dispatchers.Default) { restoreAaa(aaaDecompress(json.getString("content")), mapping) }
+                        withContext(Dispatchers.Default) { restoreAaa(aaaDecompress(json.getString("content")), mapping) }
+                        }
                         require(text.isNotBlank() && !text.contains('\u0000')) { "章节内容为空或异常。" }
                         withContext(Dispatchers.IO) {
                             val temporary = File(folder, "${chapter.id}.tmp")
@@ -222,18 +227,20 @@ internal class AaaClient(private val context: Context) {
 }
 
 @Composable
-internal fun AaaLibrary(model: ReaderModel) {
+internal fun AaaLibrary(model: ReaderModel, initialHit: AaaSearchHit? = null, onExit: () -> Unit = { model.aaaOnline = false }) {
     val context = LocalContext.current
     val client = remember { AaaClient(context.applicationContext) }
+    val combined = remember { CombinedSearch(client, context) }
+    var mobileHit by remember { mutableStateOf<AaaSearchHit?>(null) }
     val scope = rememberCoroutineScope()
     var keyword by rememberSaveable { mutableStateOf(model.aaaQuery) }
     var searched by remember { mutableStateOf("") }
     var page by remember { mutableStateOf(1) }
     var results by remember { mutableStateOf<AaaSearchPage?>(null) }
-    var selectedHit by remember { mutableStateOf<AaaSearchHit?>(null) }
+    var selectedHit by remember { mutableStateOf(initialHit) }
     var book by remember { mutableStateOf<AaaBook?>(null) }
     var job by remember { mutableStateOf<Job?>(null) }
-    var status by remember { mutableStateOf("输入书名或作者，搜索后选择书籍下载。") }
+    var status by remember { mutableStateOf("选择书籍查看目录，也可以搜索书名或作者。") }
     val running = job?.isActive == true
     fun start(action: suspend () -> Unit) {
         job = scope.launch {
@@ -243,37 +250,47 @@ internal fun AaaLibrary(model: ReaderModel) {
             finally { job = null }
         }
     }
-    fun back() { job?.cancel(); if (selectedHit != null) { selectedHit = null; book = null; status = "请选择书籍。" } else model.aaaOnline = false }
+    fun back() { job?.cancel(); if (initialHit != null) onExit() else if (selectedHit != null) { selectedHit = null; book = null; status = "请选择书籍。" } else onExit() }
     fun search(target: Int, query: String) { start {
         status = "正在搜索…"
-        val found = client.search(query, target)
+        val found = combined.search(query, target)
         results = found; page = target; searched = query
-        status = if (found.books.isEmpty()) "没有找到相关书籍，试试其他关键词。" else "请选择书籍查看目录。"
+        status = combined.warning ?: if (found.books.isEmpty()) "没有找到相关书籍，试试其他关键词。" else "请选择书籍查看目录。"
     } }
     LaunchedEffect(Unit) {
-        if (keyword.isNotBlank()) search(1, keyword.trim())
+        if (initialHit != null) start {
+            status = "正在获取目录并验证字体…"
+            book = loadSearchBook(client, initialHit)
+            status = "已获取 ${book!!.chapters.size} 个章节条目。"
+        } else if (keyword.isNotBlank()) search(1, keyword.trim())
     }
     BackHandler { back() }
+    mobileHit?.let { hit ->
+        OnlineBooks(model, "https://www.10086txt.com/?id=${hit.book}") { mobileHit = null }
+        return
+    }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Row { TextButton(onClick = { back() }) { Text(if (selectedHit == null) "返回书架" else "返回搜索") }; Text("AAA 小说搜书", modifier = Modifier.padding(12.dp)) }
+        Row { TextButton(onClick = { back() }) { Text(if (initialHit != null) "返回书城" else if (selectedHit == null) "返回主页" else "返回搜索") }; Text(if (selectedHit == null) "搜索" else "书籍详情", modifier = Modifier.padding(12.dp)) }
         if (selectedHit == null) {
             OutlinedTextField(value = keyword, onValueChange = { keyword = it }, enabled = !running, label = { Text("书名或作者") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-            Button(enabled = !running && keyword.isNotBlank(), onClick = { results = null; search(1, keyword.trim()) }) { Text("搜索") }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(enabled = !running && keyword.isNotBlank(), onClick = { search(1, keyword.trim()) }) { Text("搜索") }
+            }
         } else {
             Text(selectedHit!!.title, style = MaterialTheme.typography.titleLarge)
             Text(selectedHit!!.author)
-            if (book == null && !running) Button(onClick = { val hit = selectedHit!!; start { status = "正在获取目录并验证字体…"; book = client.load("https://www.aaawz.cc/#/book/${hit.book}/${hit.site}"); status = "已获取 ${book!!.chapters.size} 个章节条目。" } }) { Text("重试获取目录") }
+            if (book == null && !running) Button(onClick = { val hit = selectedHit!!; start { status = "正在获取目录…"; book = loadSearchBook(client, hit); status = "已获取 ${book!!.chapters.size} 个章节条目。" } }) { Text("重试获取目录") }
         }
         Text(status)
         if (model.downloadStatus.isNotBlank()) Text(model.downloadStatus)
         model.downloadingBook?.let { readyBook ->
-            Button(onClick = { model.aaaOnline = false; model.open(readyBook) }, enabled = !model.busy) { Text("立即阅读已下载内容") }
+            Button(onClick = { onExit(); model.open(readyBook) }, enabled = !model.busy) { Text("立即阅读已下载内容") }
         }
         if (running) { LinearProgressIndicator(Modifier.fillMaxWidth()); TextButton(onClick = { job?.cancel() }) { Text("停止") } }
         if (selectedHit == null) results?.let { found ->
             LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(found.books, key = { "${it.book}-${it.site}" }) { hit ->
-                    Card(onClick = { selectedHit = hit; book = null; start { status = "正在获取目录并验证字体…"; book = client.load("https://www.aaawz.cc/#/book/${hit.book}/${hit.site}"); status = "已获取 ${book!!.chapters.size} 个章节条目。" } }, enabled = !running, modifier = Modifier.fillMaxWidth()) {
+                    Card(onClick = { if (hit.site == "mobile") mobileHit = hit else { selectedHit = hit; book = null; start { status = "正在获取目录…"; book = loadSearchBook(client, hit); status = "已获取 ${book!!.chapters.size} 个章节条目。" } } }, enabled = !running, modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(16.dp)) { Text(hit.title, style = MaterialTheme.typography.titleMedium); Text(hit.author); Text("查看目录并下载", style = MaterialTheme.typography.bodySmall) }
                     }
                 }
@@ -298,3 +315,4 @@ internal fun AaaLibrary(model: ReaderModel) {
         }
     }
 }
+
